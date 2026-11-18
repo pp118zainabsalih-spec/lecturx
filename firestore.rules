@@ -1,0 +1,99 @@
+rules_version = '2';
+// Lecture (ليكچر) — Firestore security rules v1.9
+// Each student reads and writes only his own documents. The owner (ADMIN UIDs below, same list as ADMIN_UIDS
+// in index.html) manages subscriptions, activation codes and prices. A student cannot extend his own
+// subscription except by redeeming an unused activation code in the same write.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function isAdmin() { return signedIn() && request.auth.uid in []; }
+    function me() { return request.auth.uid; }
+    function userDoc() { return get(/databases/$(database)/documents/users/$(me())).data; }
+    function changed() { return request.resource.data.diff(resource.data).affectedKeys(); }
+
+    // ---------- Student profile ----------
+    // A code redemption must: name an unused code, mark it redeemed by this student in the same batch,
+    // and add no more days than the code carries (2 days of slack for a phone with a wrong clock).
+    function redeemOk(uid) {
+      let code = request.resource.data.lastCode;
+      let before = get(/databases/$(database)/documents/codes/$(code)).data;
+      let after = getAfter(/databases/$(database)/documents/codes/$(code)).data;
+      let add = before.get('days', 30) * 86400000 + 2 * 86400000;
+      return code is string && code.size() == 10
+        && before.get('redeemedBy', null) == null
+        && after.redeemedBy == uid
+        && request.resource.data.subscriptionUntil is number
+        && (request.resource.data.subscriptionUntil <= request.time.toMillis() + add
+            || request.resource.data.subscriptionUntil <= resource.data.get('subscriptionUntil', 0) + add);
+    }
+    function selfUpdateOk(uid) {
+      let keys = changed();
+      return keys.hasOnly(['displayName', 'email', 'track', 'stage', 'country', 'trialUsed', 'trialLectureId', 'subscriptionUntil', 'lastCode'])
+        && (!keys.hasAny(['trialUsed']) || request.resource.data.trialUsed == true)
+        && (!keys.hasAny(['subscriptionUntil', 'lastCode']) || redeemOk(uid));
+    }
+    match /users/{uid} {
+      allow get: if signedIn() && (me() == uid || isAdmin());
+      allow list: if isAdmin();
+      allow create: if signedIn() && me() == uid
+        && request.resource.data.get('subscriptionUntil', 0) == 0
+        && request.resource.data.get('trialUsed', false) == false
+        && request.resource.data.get('lastCode', '') == '';
+      allow update: if isAdmin() || (signedIn() && me() == uid && selfUpdateOk(uid));
+    }
+
+    // ---------- The student's own AI key: only he can read it, not even the owner ----------
+    match /secrets/{uid} {
+      allow read, write: if signedIn() && me() == uid;
+    }
+
+    // ---------- Activation codes ----------
+    match /codes/{code} {
+      allow get: if signedIn();
+      allow list, create, delete: if isAdmin();
+      allow update: if isAdmin() || (signedIn()
+        && resource.data.get('redeemedBy', null) == null
+        && request.resource.data.redeemedBy == me()
+        && changed().hasOnly(['redeemedBy', 'redeemedAt'])
+        && getAfter(/databases/$(database)/documents/users/$(me())).data.lastCode == code);
+    }
+
+    // ---------- One free trial per lecture file ----------
+    match /trialFiles/{hash} {
+      allow get: if signedIn();
+      allow create: if signedIn() && request.resource.data.uid == me();
+      allow update: if signedIn() && resource.data.uid == me() && request.resource.data.uid == me();
+    }
+
+    // ---------- Prices shown on the subscription screen ----------
+    match /settings/{id} {
+      allow read: if signedIn();
+      allow write: if isAdmin();
+    }
+
+    // ---------- Study content owned by one student ----------
+    function ownsExisting() { return signedIn() && resource.data.ownerUid == me(); }
+    function ownsNew() { return signedIn() && request.resource.data.ownerUid == me(); }
+    function keepsOwner() { return request.resource.data.ownerUid == resource.data.ownerUid; }
+    // A lecture is saved only with an active subscription, or as the one free trial lecture.
+    function mayAddLecture() {
+      let u = userDoc();
+      return isAdmin()
+        || u.get('subscriptionUntil', 0) > request.time.toMillis()
+        || (request.resource.data.isTrial == true && u.get('trialUsed', false) == false);
+    }
+    match /lectures/{id} {
+      allow read: if ownsExisting();
+      allow create: if ownsNew() && mayAddLecture();
+      allow update: if ownsExisting() && keepsOwner();
+      allow delete: if ownsExisting();
+    }
+    match /{col}/{id} {
+      allow read: if col in ['outputs', 'exams', 'attempts', 'recalls', 'plans'] && ownsExisting();
+      allow create: if col in ['outputs', 'exams', 'attempts', 'recalls', 'plans'] && ownsNew();
+      allow update: if col in ['outputs', 'exams', 'attempts', 'recalls', 'plans'] && ownsExisting() && keepsOwner();
+      allow delete: if col in ['outputs', 'exams', 'attempts', 'recalls', 'plans'] && ownsExisting();
+    }
+  }
+}
